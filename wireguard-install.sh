@@ -23,7 +23,7 @@ BACKUP_DIR="/root/wg-backups"
 QR_CMD="$(command -v qrencode || true)"
 
 detect_iface() {
-  # Detectra interfaz de salida principal (para NAT)
+  # Detecta interfaz de salida principal (para NAT)
   # Si no encuentra, usa "eth0" como fallback
   local iface
   iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}') || true
@@ -84,23 +84,32 @@ backup_conf() {
 }
 
 restart_wg() {
+  # Recarga inteligente: si wg0 existe, recarga en caliente; si no, levanta
   systemctl daemon-reload || true
-  if systemctl is-enabled --quiet "wg-quick@${WG_IFACE}"; then
-    systemctl restart "wg-quick@${WG_IFACE}"
+  if ip link show "${WG_IFACE}" >/dev/null 2>&1; then
+    # Recarga sin bajar la interfaz (no corta la VPN)
+    wg syncconf "${WG_IFACE}" <(wg-quick strip "${WG_IFACE}") || {
+      echo "Aviso: syncconf devolvió error; la interfaz sigue arriba." >&2
+      return 1
+    }
   else
-    wg-quick down "${WG_IFACE}" 2>/dev/null || true
-    wg-quick up "${WG_IFACE}"
-    systemctl enable "wg-quick@${WG_IFACE}"
+    wg-quick up "${WG_IFACE}" || { echo "Error al levantar ${WG_IFACE}"; return 1; }
+    systemctl enable "wg-quick@${WG_IFACE}" || true
   fi
+  return 0
 }
 
 print_qr() {
   local file="$1"
   if [[ -n "$QR_CMD" ]]; then
-    echo
-    echo "===== QR ====="
-    "$QR_CMD" -t ansiutf8 < "$file" || true
-    echo "=============="
+    if [[ -f "$file" ]]; then
+      echo
+      echo "===== QR ====="
+      "$QR_CMD" -t ansiutf8 < "$file" || true
+      echo "=============="
+    else
+      echo "No se encuentra el archivo del cliente para QR: $file" >&2
+    fi
   fi
 }
 
@@ -190,7 +199,7 @@ EOF
 
   # Habilitar forwarding
   if ! sysctl -q net.ipv4.ip_forward | grep -q " = 1"; then
-    sed -i 's/^#\?net\.ipv4\.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+    sed -i 's/^#\?net\.ipv4\.ip_forward.*/net.ipv4\.ip_forward=1/' /etc/sysctl.conf
     sysctl -p >/dev/null || true
   fi
 
@@ -210,7 +219,7 @@ EOF
 }
 
 list_clients() {
-  grep -n "^\[Peer\]" -n "$WG_CONF" 2>/dev/null | sed 's/:.*//g' | while read -r ln; do
+  grep -n "^\[Peer\]" "$WG_CONF" 2>/dev/null | sed 's/:.*//g' | while read -r ln; do
     name=$(sed -n "$((ln-1))p" "$WG_CONF" | sed 's/^# *Client: *//')
     [[ -n "$name" ]] && echo "$name"
   done
@@ -316,13 +325,16 @@ EOF
     echo
   } >> "$WG_CONF"
 
-  restart_wg
-
+  # Mostrar QR SIEMPRE, y luego intentar recarga sin cortar si ya existe
   echo
   echo "Cliente creado: ${CLIENT} (${CLIENT_IP})"
   echo "Archivo: ${CLIENT_FILE}"
   print_qr "$CLIENT_FILE"
   echo
+
+  # Recarga (no abortar si da warning)
+  restart_wg || true
+
   echo "TIPOS:"
   echo "  - Normal: el cliente sale a Internet por la VPN (full-tunnel) o por su red local (si cambiaste AllowedIPs)."
   echo "  - Intranet-only: alcanza solo las redes que pusiste en AllowedIPs."
@@ -370,7 +382,7 @@ remove_client() {
     }' "$WG_CONF" > "${WG_CONF}.tmp"
 
   mv "${WG_CONF}.tmp" "$WG_CONF"
-  restart_wg
+  restart_wg || true
   rm -f "/root/${target}.conf"
 
   echo "Cliente '${target}' eliminado."
@@ -399,7 +411,7 @@ menu() {
   echo "2) Agregar cliente"
   echo "3) Eliminar cliente"
   echo "4) Mostrar estado (wg show)"
-  echo "5) Reiniciar servicio"
+  echo "5) Recargar servicio (sin cortar)"
   echo "6) Desinstalar todo"
   echo "0) Salir"
   echo "===================================="
@@ -418,7 +430,7 @@ main() {
       2) add_client ;;
       3) remove_client ;;
       4) wg show || echo "wg no está levantado" ;;
-      5) restart_wg ;;
+      5) restart_wg || true ;;
       6) uninstall_all ;;
       0) exit 0 ;;
       *) echo "Opción inválida" ;;
